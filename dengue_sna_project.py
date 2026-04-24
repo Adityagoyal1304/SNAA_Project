@@ -1,364 +1,327 @@
-"""
-=======================================================================
-SOCIAL NETWORK ANALYSIS PROJECT
-TITLE  : Dengue Disease Spread Network Analysis – Bangladesh
-DOMAIN : Disease Spread / Epidemiological Network Analysis
-DATASET: Dengue Incidents & Weather Data of Bangladesh (Kaggle)
-         https://www.kaggle.com/datasets/fazlyrabbi/dengue-incidents-weather-of-bangladesh
-=======================================================================
-
-WHAT THIS PROJECT DOES
------------------------
-Models the spread of Dengue fever across Bangladeshi districts as a
-weighted, directed network graph where:
-  - NODES  = Districts (administrative regions)
-  - EDGES  = Disease transmission pathways (weighted by case counts
-             and geographic/climatic proximity)
-  - WEIGHT = Strength of transmission link (normalized case burden)
-
-KEY SNA METRICS COMPUTED
--------------------------
-1. Degree Centrality        – Which districts drive the most connections?
-2. Betweenness Centrality   – Which districts act as "bridges" in spread?
-3. Closeness Centrality     – Which districts can reach others fastest?
-4. PageRank                 – Recursive influence / super-spreader score
-5. Clustering Coefficient   – Local cluster density
-6. Community Detection      – Louvain-style epidemic clusters
-7. Network Diameter         – Maximum hops across the spread network
-8. Average Path Length      – Speed of transmission across network
-"""
-
+import os
 import networkx as nx
 import pandas as pd
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-from matplotlib.gridspec import GridSpec
-import warnings
-warnings.filterwarnings("ignore")
+import matplotlib.dates as mdates
+import seaborn as sns
+from networkx.algorithms.community import greedy_modularity_communities
 
-np.random.seed(42)
+# ================================================================
+# 1. LOAD DATASET
+# ================================================================
+data_dir = "./data"
 
-# -----------------------------------------------------------------------
-# SECTION 1 – SYNTHETIC DATASET (mirrors real Kaggle dataset structure)
-# -----------------------------------------------------------------------
-# The real dataset contains district-level dengue case counts per month
-# with weather variables (temp, rainfall, humidity).
-# We reproduce the same structure synthetically so the code runs
-# without a Kaggle API key, but the ANALYSIS LOGIC IS IDENTICAL.
+# Download from Kaggle if data doesn't exist
+if not os.path.exists(data_dir) or not any(f.endswith('.csv') for f in os.listdir(data_dir)):
+    try:
+        from kaggle.api.kaggle_api_extended import KaggleApi
+        api = KaggleApi()
+        api.authenticate()
+        api.dataset_download_files(
+            "fazlyrabbi/dengue-incidents-weather-of-bangladesh",
+            path=data_dir, unzip=True
+        )
+        print("Dataset downloaded from Kaggle.")
+    except Exception as e:
+        print(f"Kaggle download failed: {e}")
+        exit(1)
 
-DISTRICTS = [
-    "Dhaka", "Chittagong", "Rajshahi", "Sylhet", "Khulna",
-    "Barisal", "Rangpur", "Mymensingh", "Comilla", "Narayanganj",
-    "Gazipur", "Narsingdi", "Tangail", "Faridpur", "Jessore",
-    "Bogra", "Dinajpur", "Pabna", "Sirajganj", "Cox's Bazar"
-]
+file = [f for f in os.listdir(data_dir) if f.endswith(".csv")][0]
+df = pd.read_csv(os.path.join(data_dir, file))
+print(f"Loaded: {file} ({len(df)} records)")
 
-# Simulate monthly dengue case data (2010–2022)
-months = pd.date_range("2010-01", "2022-12", freq="MS")
-records = []
-for district in DISTRICTS:
-    base = np.random.randint(20, 500)
-    for m in months:
-        # Monsoon seasonality – peak June–October
-        seasonality = 1 + 2.5 * max(0, np.sin((m.month - 3) * np.pi / 7))
-        cases = int(base * seasonality * np.random.lognormal(0, 0.4))
-        temp  = np.random.normal(28 + 4 * np.sin((m.month - 1) * np.pi / 6), 1.5)
-        rain  = max(0, np.random.normal(120 * seasonality, 40))
-        humid = np.random.normal(75, 8)
-        records.append({"district": district, "month": m,
-                        "cases": cases, "temp_C": round(temp, 1),
-                        "rainfall_mm": round(rain, 1),
-                        "humidity_pct": round(humid, 1)})
+# Normalize column names
+df.columns = [c.lower() for c in df.columns]
+df = df.rename(columns={
+    "year": "year", "month": "month", "dengue": "cases",
+    "min": "temp_min", "max": "temp_max",
+    "humidity": "humidity", "rainfall": "rainfall"
+})
 
-df = pd.DataFrame(records)
-print("=" * 60)
-print("DENGUE DISEASE SPREAD – SOCIAL NETWORK ANALYSIS")
-print("=" * 60)
-print(f"\n[DATA] Shape: {df.shape}")
-print(df.head())
+# Create datetime and normalized cases
+df["date"] = pd.to_datetime(df["year"].astype(str) + "-" + df["month"].astype(str).str.zfill(2))
+df["case_norm"] = df["cases"] / df["cases"].max()
+df["period"] = df["date"].dt.strftime("%Y-%m")
+df["temp_avg"] = (df["temp_min"] + df["temp_max"]) / 2
 
-# -----------------------------------------------------------------------
-# SECTION 2 – AGGREGATE & NORMALISE
-# -----------------------------------------------------------------------
-district_stats = (
-    df.groupby("district")
-      .agg(total_cases=("cases", "sum"),
-           avg_temp=("temp_C", "mean"),
-           avg_rain=("rainfall_mm", "mean"),
-           avg_humid=("humidity_pct", "mean"))
-      .reset_index()
-)
-district_stats["case_norm"] = (
-    district_stats["total_cases"] / district_stats["total_cases"].max()
-)
-print("\n[STATS] District aggregates (top 5):")
-print(district_stats.sort_values("total_cases", ascending=False).head())
+print(f"Time range: {df['date'].min().date()} to {df['date'].max().date()}")
+print(f"Total dengue cases: {df['cases'].sum():,}")
+print(f"Peak month: {df.loc[df['cases'].idxmax(), 'period']} ({df['cases'].max():,} cases)")
 
-# -----------------------------------------------------------------------
-# SECTION 3 – BUILD THE TRANSMISSION NETWORK
-# -----------------------------------------------------------------------
-# Edge weight = composite similarity score (climate + case burden).
-# Two districts are linked if their climatic profiles are similar AND
-# both have significant case burdens → transmission corridor.
-
-def transmission_weight(r1, r2):
-    """
-    Compute directed edge weight from district r1 → r2.
-    Higher-burden districts 'push' transmission to similar neighbors.
-    """
-    temp_sim  = 1 / (1 + abs(r1.avg_temp  - r2.avg_temp))
-    rain_sim  = 1 / (1 + abs(r1.avg_rain  - r2.avg_rain) / 10)
-    humid_sim = 1 / (1 + abs(r1.avg_humid - r2.avg_humid))
-    climate_sim = (temp_sim + rain_sim + humid_sim) / 3
-    burden_factor = r1.case_norm  # source drives transmission
-    weight = climate_sim * burden_factor
-    return round(weight, 4)
-
+# ================================================================
+# 2. BUILD DIRECTED WEIGHTED GRAPH
+# ================================================================
 G = nx.DiGraph()
-G.add_nodes_from(DISTRICTS)
 
-for i, r1 in district_stats.iterrows():
-    for j, r2 in district_stats.iterrows():
+for _, row in df.iterrows():
+    G.add_node(row["date"], period=row["period"], cases=int(row["cases"]),
+               temp_avg=row["temp_avg"], rainfall=row["rainfall"],
+               humidity=row["humidity"], year=int(row["year"]),
+               month=int(row["month"]))
+
+def sim(a, b):
+    return 1 / (1 + abs(a - b))
+
+def compute_weight(r1, r2):
+    temp_sim = sim(r1["temp_avg"], r2["temp_avg"])
+    rain_sim = sim(r1["rainfall"], r2["rainfall"])
+    hum_sim  = sim(r1["humidity"], r2["humidity"])
+    climate_sim = (temp_sim + rain_sim + hum_sim) / 3
+    # Weight combines climate similarity with source case burden
+    return climate_sim * r1["case_norm"]
+
+rows = df.to_dict("records")
+threshold = 0.05  # Lower threshold for denser network
+
+for i in range(len(rows)):
+    for j in range(len(rows)):
         if i == j:
             continue
-        w = transmission_weight(r1, r2)
-        if w > 0.25:  # threshold – only meaningful transmission links
-            G.add_edge(r1.district, r2.district, weight=w)
+        w = compute_weight(rows[i], rows[j])
+        if w > threshold:
+            G.add_edge(rows[i]["date"], rows[j]["date"], weight=w)
 
-print(f"\n[NETWORK] Nodes : {G.number_of_nodes()}")
-print(f"[NETWORK] Edges : {G.number_of_edges()}")
-print(f"[NETWORK] Density: {nx.density(G):.4f}")
+print(f"\n{'='*50}")
+print("NETWORK CONSTRUCTION")
+print(f"{'='*50}")
+print(f"Nodes: {G.number_of_nodes()}")
+print(f"Edges: {G.number_of_edges()}")
 
-# -----------------------------------------------------------------------
-# SECTION 4 – SNA METRICS
-# -----------------------------------------------------------------------
-print("\n" + "=" * 60)
-print("SNA CENTRALITY METRICS")
-print("=" * 60)
+# ================================================================
+# 3. COMPREHENSIVE SNA METRICS
+# ================================================================
+print(f"\n{'='*50}")
+print("SNA METRICS")
+print(f"{'='*50}")
 
-# 4.1 Degree Centrality
-in_deg  = nx.in_degree_centrality(G)
-out_deg = nx.out_degree_centrality(G)
+# Node-level centrality
+pagerank    = nx.pagerank(G, weight="weight")
+in_deg_c    = nx.in_degree_centrality(G)
+out_deg_c   = nx.out_degree_centrality(G)
+betweenness = nx.betweenness_centrality(G)
+closeness   = nx.closeness_centrality(G)
+clustering  = nx.clustering(G)
 
-# 4.2 Betweenness Centrality – identifies broker districts
-betweenness = nx.betweenness_centrality(G, weight="weight", normalized=True)
+# HITS
+try:
+    hubs, authorities = nx.hits(G, max_iter=1000)
+except:
+    hubs = {n: 0 for n in G.nodes()}
+    authorities = {n: 0 for n in G.nodes()}
 
-# 4.3 Closeness Centrality – speed of reaching other nodes
-closeness = nx.closeness_centrality(G)
+# Network-level stats
+density = nx.density(G)
+print(f"Network Density: {density:.4f}")
 
-# 4.4 PageRank – recursive influence (super-spreader score)
-pagerank = nx.pagerank(G, weight="weight", alpha=0.85)
+sccs = list(nx.strongly_connected_components(G))
+print(f"Strongly Connected Components: {len(sccs)}")
+largest_scc = max(sccs, key=len)
+print(f"Largest SCC size: {len(largest_scc)}")
 
-# 4.5 Clustering Coefficient (undirected projection)
-G_und = G.to_undirected()
-clustering = nx.clustering(G_und, weight="weight")
+wccs = list(nx.weakly_connected_components(G))
+print(f"Weakly Connected Components: {len(wccs)}")
 
-# Compile into DataFrame
-metrics_df = pd.DataFrame({
-    "District"       : list(G.nodes()),
-    "In_Degree_C"    : [in_deg[n]      for n in G.nodes()],
-    "Out_Degree_C"   : [out_deg[n]     for n in G.nodes()],
-    "Betweenness"    : [betweenness[n] for n in G.nodes()],
-    "Closeness"      : [closeness[n]   for n in G.nodes()],
-    "PageRank"       : [pagerank[n]    for n in G.nodes()],
-    "Clustering"     : [clustering[n]  for n in G.nodes()],
-}).set_index("District").round(4)
-
-metrics_df["TotalCases"] = metrics_df.index.map(
-    district_stats.set_index("district")["total_cases"])
-
-print(metrics_df.sort_values("PageRank", ascending=False).to_string())
-
-# 4.6 Top Super-Spreader Districts
-top_spreaders = metrics_df["PageRank"].nlargest(5)
-print("\n[TOP SUPER-SPREADERS by PageRank]")
-for d, v in top_spreaders.items():
-    print(f"  {d:20s} PageRank={v:.4f}")
-
-# 4.7 Top Bridge Districts (Betweenness)
-top_bridges = metrics_df["Betweenness"].nlargest(5)
-print("\n[TOP BRIDGE DISTRICTS by Betweenness Centrality]")
-for d, v in top_bridges.items():
-    print(f"  {d:20s} Betweenness={v:.4f}")
-
-# 4.8 Global Network Statistics
-print("\n[GLOBAL NETWORK STATS]")
-print(f"  Number of Strongly Connected Components : {nx.number_strongly_connected_components(G)}")
-print(f"  Number of Weakly  Connected Components : {nx.number_weakly_connected_components(G)}")
-ug = G.to_undirected()
-if nx.is_connected(ug):
-    print(f"  Network Diameter       : {nx.diameter(ug)}")
-    print(f"  Avg Shortest Path Len  : {nx.average_shortest_path_length(ug):.4f}")
+scc_sub = G.subgraph(largest_scc)
+if nx.is_strongly_connected(scc_sub):
+    diameter = nx.diameter(scc_sub)
+    avg_path = nx.average_shortest_path_length(scc_sub)
+    print(f"Diameter (largest SCC): {diameter}")
+    print(f"Avg Shortest Path (largest SCC): {avg_path:.4f}")
 else:
-    lcc = max(nx.connected_components(ug), key=len)
-    sg  = ug.subgraph(lcc)
-    print(f"  LCC Diameter           : {nx.diameter(sg)}")
-    print(f"  LCC Avg Path Length    : {nx.average_shortest_path_length(sg):.4f}")
+    diameter = "N/A"
+    avg_path = "N/A"
+    print(f"Diameter: {diameter}")
 
-# -----------------------------------------------------------------------
-# SECTION 5 – COMMUNITY DETECTION (Greedy Modularity)
-# -----------------------------------------------------------------------
-communities_gen = nx.community.greedy_modularity_communities(G_und, weight="weight")
-communities     = list(communities_gen)
-print(f"\n[COMMUNITIES] {len(communities)} epidemic clusters detected")
-community_map   = {}
+avg_clust = nx.average_clustering(G)
+print(f"Average Clustering: {avg_clust:.4f}")
+
+reciprocity = nx.reciprocity(G)
+print(f"Reciprocity: {reciprocity:.4f}")
+
+# Community detection
+communities = list(greedy_modularity_communities(G.to_undirected()))
+modularity = nx.community.modularity(G.to_undirected(), communities)
+print(f"Communities: {len(communities)}")
+print(f"Modularity: {modularity:.4f}")
+
+community_map = {}
 for idx, comm in enumerate(communities):
-    print(f"  Cluster {idx+1}: {sorted(comm)}")
     for node in comm:
         community_map[node] = idx
 
-modularity = nx.community.modularity(G_und, communities, weight="weight")
-print(f"  Modularity Score: {modularity:.4f}")
+# Top PageRank
+top_pr = sorted(pagerank.items(), key=lambda x: x[1], reverse=True)[:10]
+print(f"\nTop 10 Outbreak Periods (PageRank):")
+for d, v in top_pr:
+    print(f"  {d.strftime('%Y-%m')}  PR={v:.4f}  Cases={G.nodes[d]['cases']}")
 
-# -----------------------------------------------------------------------
-# SECTION 6 – VISUALISATIONS (saved as PNG files)
-# -----------------------------------------------------------------------
-PALETTE = ["#e63946", "#457b9d", "#2a9d8f", "#e9c46a", "#f4a261",
-           "#264653", "#8ecae6", "#219ebc"]
+top_bw = sorted(betweenness.items(), key=lambda x: x[1], reverse=True)[:5]
+print(f"\nTop 5 Bridge Periods (Betweenness):")
+for d, v in top_bw:
+    print(f"  {d.strftime('%Y-%m')}  BW={v:.4f}")
 
-def get_node_color(node):
-    return PALETTE[community_map.get(node, 0) % len(PALETTE)]
+# Print top 4 community compositions
+for i, comm in enumerate(communities[:4]):
+    periods = sorted([n.strftime('%Y-%m') for n in comm])
+    print(f"\nCommunity {i+1} ({len(comm)} periods): {', '.join(periods[:10])}...")
+if len(communities) > 4:
+    print(f"\n... and {len(communities)-4} more small communities")
 
-# --- FIG 1: TRANSMISSION NETWORK -----------------------------------------
-fig, ax = plt.subplots(figsize=(14, 10))
-fig.patch.set_facecolor("#0d1117")
-ax.set_facecolor("#0d1117")
+# ================================================================
+# 4. EXPORT CSV
+# ================================================================
+metrics_data = []
+for node in G.nodes():
+    metrics_data.append({
+        "Period": node.strftime("%Y-%m"),
+        "Year": G.nodes[node]["year"],
+        "Month": G.nodes[node]["month"],
+        "Cases": G.nodes[node]["cases"],
+        "In_Degree_C": round(in_deg_c[node], 4),
+        "Out_Degree_C": round(out_deg_c[node], 4),
+        "Betweenness": round(betweenness[node], 4),
+        "Closeness": round(closeness[node], 4),
+        "PageRank": round(pagerank[node], 4),
+        "Clustering": round(clustering[node], 4),
+        "Hub_Score": round(hubs[node], 4),
+        "Authority_Score": round(authorities[node], 4),
+        "Community": community_map.get(node, -1)
+    })
 
-pos   = nx.spring_layout(G, seed=42, k=2.5)
-sizes = [5000 * pagerank[n] for n in G.nodes()]
-colors= [get_node_color(n) for n in G.nodes()]
-edge_w= [G[u][v]["weight"] * 3 for u, v in G.edges()]
+metrics_df = pd.DataFrame(metrics_data).sort_values("Period")
+metrics_df.to_csv("sna_metrics.csv", index=False)
+print(f"\nExported: sna_metrics.csv ({len(metrics_df)} rows)")
 
-nx.draw_networkx_edges(G, pos, ax=ax, edge_color="#ffffff22",
-                       width=edge_w, arrows=True,
-                       arrowstyle="-|>", arrowsize=15,
-                       connectionstyle="arc3,rad=0.1")
-nx.draw_networkx_nodes(G, pos, ax=ax, node_size=sizes,
-                       node_color=colors, alpha=0.92)
-nx.draw_networkx_labels(G, pos, ax=ax, font_size=7,
-                        font_color="white", font_weight="bold")
+# ================================================================
+# 5. VISUALIZATIONS
+# ================================================================
+DARK_BG = '#1a1a2e'
+DARK_FG = '#e0e0e0'
+COMM_COLORS = ['#e94560', '#537FE7', '#16c79a', '#f5a623', '#8b5cf6', '#ec4899']
 
-ax.set_title("Dengue Transmission Network – Bangladesh Districts\n"
-             "Node size ∝ PageRank | Color = Epidemic Cluster | "
-             "Edge weight ∝ Transmission Strength",
-             color="white", fontsize=13, pad=15)
-ax.axis("off")
+pos = nx.spring_layout(G, seed=42, k=2.5/np.sqrt(G.number_of_nodes()))
 
-patches = [mpatches.Patch(color=PALETTE[i], label=f"Cluster {i+1}")
-           for i in range(len(communities))]
-ax.legend(handles=patches, loc="lower left", framealpha=0.3,
-          labelcolor="white", facecolor="#111")
+# --- Fig 1: Transmission Network ---
+fig1, ax1 = plt.subplots(figsize=(14, 10), facecolor=DARK_BG)
+ax1.set_facecolor(DARK_BG)
 
-plt.tight_layout()
-plt.savefig("/mnt/user-data/outputs/fig1_transmission_network.png",
-            dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
-plt.close()
-print("\n[SAVED] fig1_transmission_network.png")
+node_colors = [COMM_COLORS[community_map.get(n, 0) % len(COMM_COLORS)] for n in G.nodes()]
+max_pr = max(pagerank.values())
+node_sizes = [2500 * (pagerank[n] / max_pr) + 30 for n in G.nodes()]
 
-# --- FIG 2: CENTRALITY COMPARISON BAR CHARTS ----------------------------
-fig, axes = plt.subplots(2, 2, figsize=(16, 10))
-fig.patch.set_facecolor("#0d1117")
-fig.suptitle("Centrality Metrics – Dengue Spread Network",
-             color="white", fontsize=15, y=1.01)
+nx.draw_networkx_edges(G, pos, alpha=0.06, edge_color='#ffffff', width=0.3, arrows=False, ax=ax1)
+nx.draw_networkx_nodes(G, pos, node_color=node_colors, node_size=node_sizes,
+                       alpha=0.85, ax=ax1, edgecolors='white', linewidths=0.5)
 
-metrics_plot = metrics_df.sort_values("PageRank", ascending=False)
-bar_cfg = [
-    ("PageRank",    "#e63946", "PageRank (Super-Spreader Score)"),
-    ("Betweenness", "#457b9d", "Betweenness Centrality (Bridge Nodes)"),
-    ("Closeness",   "#2a9d8f", "Closeness Centrality (Reach Speed)"),
-    ("Clustering",  "#e9c46a", "Clustering Coefficient"),
+labels = {d: d.strftime("%Y-%m") for d, _ in top_pr[:8]}
+nx.draw_networkx_labels(G, pos, labels, font_size=7, font_color='white', font_weight='bold', ax=ax1)
+
+ax1.set_title("Dengue Temporal Transmission Network – Bangladesh\n"
+              "Node size ∝ PageRank | Color = Community | Edge weight ∝ Climate Similarity × Case Burden",
+              color=DARK_FG, fontsize=13, fontweight='bold', pad=15)
+
+from matplotlib.patches import Patch
+legend_patches = [Patch(facecolor=COMM_COLORS[i], label=f'Community {i+1}')
+                  for i in range(min(len(communities), 4))]
+ax1.legend(handles=legend_patches, loc='lower left', fontsize=9,
+           facecolor=DARK_BG, edgecolor='#444', labelcolor=DARK_FG)
+ax1.axis('off')
+fig1.tight_layout()
+fig1.savefig("fig1_transmission_network.png", dpi=200, facecolor=DARK_BG, bbox_inches='tight')
+plt.close(fig1)
+print("Saved: fig1_transmission_network.png")
+
+# --- Fig 2: Centrality Metrics Bar Charts ---
+fig2, axes2 = plt.subplots(2, 2, figsize=(16, 10), facecolor=DARK_BG)
+chart_data = [
+    ("PageRank (Outbreak Influence)", pagerank, '#e94560'),
+    ("Betweenness (Bridge Periods)", betweenness, '#537FE7'),
+    ("Closeness (Reach Speed)", closeness, '#16c79a'),
+    ("Clustering Coefficient", clustering, '#f5a623')
 ]
-for ax, (col, color, title) in zip(axes.flat, bar_cfg):
-    ax.set_facecolor("#161b22")
-    sorted_m = metrics_df[col].sort_values(ascending=False)
-    bars = ax.barh(sorted_m.index, sorted_m.values, color=color, alpha=0.85)
-    ax.set_title(title, color="white", fontsize=10)
-    ax.tick_params(colors="white", labelsize=7)
+for ax, (title, metric, color) in zip(axes2.flat, chart_data):
+    ax.set_facecolor(DARK_BG)
+    top20 = sorted(metric.items(), key=lambda x: x[1], reverse=True)[:20]
+    lbls = [d.strftime("%Y-%m") for d, _ in top20]
+    vals = [v for _, v in top20]
+    ax.barh(range(len(lbls)), vals, color=color, alpha=0.85)
+    ax.set_yticks(range(len(lbls)))
+    ax.set_yticklabels(lbls, fontsize=7, color=DARK_FG)
+    ax.set_xlabel("Score", color=DARK_FG, fontsize=9)
+    ax.set_title(title, color=DARK_FG, fontsize=11, fontweight='bold')
+    ax.tick_params(colors=DARK_FG, labelsize=8)
+    ax.invert_yaxis()
     for spine in ax.spines.values():
-        spine.set_edgecolor("#30363d")
-    ax.set_xlabel("Score", color="#8b949e", fontsize=8)
+        spine.set_color('#333')
 
-plt.tight_layout()
-plt.savefig("/mnt/user-data/outputs/fig2_centrality_metrics.png",
-            dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
-plt.close()
-print("[SAVED] fig2_centrality_metrics.png")
+fig2.suptitle("Centrality Metrics – Dengue Temporal Network",
+              color=DARK_FG, fontsize=14, fontweight='bold')
+fig2.tight_layout(rect=[0, 0, 1, 0.96])
+fig2.savefig("fig2_centrality_metrics.png", dpi=200, facecolor=DARK_BG, bbox_inches='tight')
+plt.close(fig2)
+print("Saved: fig2_centrality_metrics.png")
 
-# --- FIG 3: SEASONAL TRENDS (Monthly Cases) -----------------------------
-fig, axes = plt.subplots(2, 1, figsize=(14, 9))
-fig.patch.set_facecolor("#0d1117")
+# --- Fig 3: Seasonal Trends & Heatmap ---
+fig3, (ax3a, ax3b) = plt.subplots(2, 1, figsize=(14, 9), gridspec_kw={'height_ratios': [1.2, 1]})
 
-top5 = metrics_df["TotalCases"].nlargest(5).index.tolist()
-monthly = df[df["district"].isin(top5)].groupby(["month", "district"])["cases"].sum().reset_index()
+ax3a.fill_between(df["date"], df["cases"], alpha=0.3, color='#e94560')
+ax3a.plot(df["date"], df["cases"], color='#e94560', linewidth=1.5)
+ax3a.set_title("Monthly Dengue Cases – Bangladesh (National Level)", fontsize=13, fontweight='bold')
+ax3a.set_ylabel("Confirmed Cases")
+ax3a.grid(alpha=0.3)
+ax3a.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+ax3a.xaxis.set_major_locator(mdates.YearLocator())
 
-ax = axes[0]
-ax.set_facecolor("#161b22")
-for i, dist in enumerate(top5):
-    d = monthly[monthly["district"] == dist]
-    ax.plot(d["month"], d["cases"], label=dist,
-            color=PALETTE[i], linewidth=1.8, alpha=0.9)
-ax.set_title("Monthly Dengue Cases – Top 5 Districts", color="white", fontsize=11)
-ax.tick_params(colors="white")
-ax.legend(facecolor="#111", labelcolor="white", fontsize=8)
-for spine in ax.spines.values():
-    spine.set_edgecolor("#30363d")
+month_names = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec']
+pivot = df.pivot_table(values="cases", index="year", columns="month", aggfunc="sum").fillna(0)
+pivot.columns = [month_names[int(c)-1] for c in pivot.columns]
+sns.heatmap(pivot, cmap='YlOrRd', annot=True, fmt='.0f', linewidths=0.5, ax=ax3b,
+            cbar_kws={'label': 'Cases'}, annot_kws={'size': 8})
+ax3b.set_title("Cases Heatmap (Year × Month)", fontsize=13, fontweight='bold')
+ax3b.set_ylabel("Year")
+ax3b.set_xlabel("Month")
 
-# Monthly heatmap of all districts
-ax2 = axes[1]
-ax2.set_facecolor("#161b22")
-pivot = df.pivot_table(index="district", columns=df["month"].dt.month,
-                       values="cases", aggfunc="mean")
-pivot.columns = ["Jan","Feb","Mar","Apr","May","Jun",
-                 "Jul","Aug","Sep","Oct","Nov","Dec"]
-im = ax2.imshow(pivot.values, aspect="auto", cmap="YlOrRd")
-ax2.set_xticks(range(12))
-ax2.set_xticklabels(pivot.columns, color="white", fontsize=8)
-ax2.set_yticks(range(len(pivot.index)))
-ax2.set_yticklabels(pivot.index, color="white", fontsize=7)
-ax2.set_title("Average Cases Heatmap (District × Month)", color="white", fontsize=11)
-plt.colorbar(im, ax=ax2, label="Avg Cases")
+fig3.tight_layout()
+fig3.savefig("fig3_seasonal_trends.png", dpi=200, bbox_inches='tight')
+plt.close(fig3)
+print("Saved: fig3_seasonal_trends.png")
 
-plt.tight_layout()
-plt.savefig("/mnt/user-data/outputs/fig3_seasonal_trends.png",
-            dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
-plt.close()
-print("[SAVED] fig3_seasonal_trends.png")
+# --- Fig 4: Degree Distribution ---
+fig4, (ax4a, ax4b) = plt.subplots(1, 2, figsize=(14, 5), facecolor=DARK_BG)
 
-# --- FIG 4: DEGREE DISTRIBUTION (Power-law check) -----------------------
-fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-fig.patch.set_facecolor("#0d1117")
+in_degs = [d for _, d in G.in_degree()]
+out_degs = [d for _, d in G.out_degree()]
 
-in_degrees  = [d for _, d in G.in_degree()]
-out_degrees = [d for _, d in G.out_degree()]
-
-for ax, deg, title, color in zip(
-        axes,
-        [in_degrees, out_degrees],
-        ["In-Degree Distribution", "Out-Degree Distribution"],
-        ["#e63946", "#457b9d"]):
-    ax.set_facecolor("#161b22")
-    ax.hist(deg, bins=10, color=color, edgecolor="#30363d", alpha=0.85)
-    ax.set_title(title, color="white", fontsize=11)
-    ax.set_xlabel("Degree", color="#8b949e")
-    ax.set_ylabel("Frequency", color="#8b949e")
-    ax.tick_params(colors="white")
+for ax, degs, title, color in [(ax4a, in_degs, "In-Degree Distribution", '#e94560'),
+                                (ax4b, out_degs, "Out-Degree Distribution", '#537FE7')]:
+    ax.set_facecolor(DARK_BG)
+    ax.hist(degs, bins=range(min(degs), max(degs)+2), color=color, alpha=0.85,
+            edgecolor=DARK_BG, rwidth=0.85)
+    ax.set_title(title, color=DARK_FG, fontsize=12, fontweight='bold')
+    ax.set_xlabel("Degree", color=DARK_FG)
+    ax.set_ylabel("Frequency", color=DARK_FG)
+    ax.tick_params(colors=DARK_FG)
     for spine in ax.spines.values():
-        spine.set_edgecolor("#30363d")
+        spine.set_color('#333')
 
-fig.suptitle("Degree Distribution – Dengue Transmission Network",
-             color="white", fontsize=13)
-plt.tight_layout()
-plt.savefig("/mnt/user-data/outputs/fig4_degree_distribution.png",
-            dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
-plt.close()
-print("[SAVED] fig4_degree_distribution.png")
+fig4.suptitle("Degree Distribution – Dengue Temporal Network",
+              color=DARK_FG, fontsize=14, fontweight='bold')
+fig4.tight_layout(rect=[0, 0, 1, 0.93])
+fig4.savefig("fig4_degree_distribution.png", dpi=200, facecolor=DARK_BG, bbox_inches='tight')
+plt.close(fig4)
+print("Saved: fig4_degree_distribution.png")
 
-# -----------------------------------------------------------------------
-# SECTION 7 – EXPORT METRICS TO CSV
-# -----------------------------------------------------------------------
-metrics_df.to_csv("/mnt/user-data/outputs/sna_metrics.csv")
-df.to_csv("/mnt/user-data/outputs/dengue_dataset.csv", index=False)
-print("\n[SAVED] sna_metrics.csv")
-print("[SAVED] dengue_dataset.csv")
-print("\n✅  ALL DONE – check /mnt/user-data/outputs/")
+# --- network.png (simple version) ---
+fig_n, ax_n = plt.subplots(figsize=(10, 6))
+sizes = [5000*pagerank[n] for n in G.nodes()]
+nx.draw(G, pos, node_size=sizes, with_labels=False, ax=ax_n,
+        node_color=node_colors, edge_color='gray', alpha=0.7, width=0.2)
+ax_n.set_title("Dengue Spread (Time-based Network)")
+fig_n.savefig("network.png", dpi=150)
+plt.close(fig_n)
+print("Saved: network.png")
+
+print("\nDONE - ALL OUTPUTS GENERATED SUCCESSFULLY")
